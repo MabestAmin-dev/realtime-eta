@@ -1,76 +1,159 @@
 import os
-import math
 import time
-from typing import Optional
+from datetime import datetime
+from typing import List
+
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from prometheus_client import Counter, Histogram, generate_latest
 from fastapi.responses import PlainTextResponse
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, Summary, generate_latest
+
+from .core.engine import ETAEngine
+from .core.traffic import TrafficModel
+from .core.geodesy import haversine_km
+from .models import (
+    BatchETARequest,
+    Diagnostics,
+    ETARequest,
+    MatrixETARequest,
+    RouteETARequest,
+    TrafficUpdate,
+)
 
 USE_CPP = os.getenv("USE_CPP") == "1"
 LIB_PATH = os.getenv("ETA_LIB", "/app/libetacore.so")
+CACHE_TTL = int(os.getenv("ETA_CACHE_TTL", "60"))
 
-# Metrics
-req_counter = Counter('eta_requests_total', 'Total ETA requests')
-latency_hist = Histogram('eta_latency_ms', 'ETA compute latency (ms)')
+traffic_model = TrafficModel(resolution=int(os.getenv("H3_RESOLUTION", "8")))
+engine = ETAEngine(traffic_model, use_cpp=USE_CPP, lib_path=LIB_PATH, cache_ttl_seconds=CACHE_TTL)
 
-class Point(BaseModel):
-    lat: float
-    lon: float
+app = FastAPI(title="Realtime ETA", version="2.0.0")
 
-class ETARequest(BaseModel):
-    origin: Point
-    destination: Point
-    speed_kmh: Optional[float] = 30.0
+REQUEST_COUNTER = Counter(
+    "eta_requests_total", "Total ETA requests processed", labelnames=("endpoint", "profile")
+)
+LATENCY_SECONDS = Histogram(
+    "eta_latency_seconds",
+    "Latency for ETA computations",
+    labelnames=("endpoint", "profile"),
+    buckets=(0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0),
+)
+DISTANCE_KM = Summary("eta_distance_km", "Distance in kilometers for single ETA requests")
+CACHE_HITS = Gauge("eta_cache_hits", "Total cache hits", multiprocess_mode="max")
+CACHE_MISSES = Gauge("eta_cache_misses", "Total cache misses", multiprocess_mode="max")
 
-app = FastAPI()
 
-def haversine_km(lat1, lon1, lat2, lon2):
-    R = 6371.0
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dl = math.radians(lon2 - lon1)
-    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dl/2)**2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-    return R * c
+def observe_cache() -> None:
+    info = engine.cache_info()
+    CACHE_HITS.set(info.get("hits", 0))
+    CACHE_MISSES.set(info.get("misses", 0))
 
-def eta_seconds_py(o: Point, d: Point, speed_kmh: float) -> float:
-    dist_km = haversine_km(o.lat, o.lon, d.lat, d.lon)
-    hours = dist_km / max(speed_kmh, 1e-3)
-    return hours * 3600
-
-try:
-    if USE_CPP:
-        import ctypes
-        lib = ctypes.CDLL(LIB_PATH)
-        lib.eta_seconds.argtypes = [ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double]
-        lib.eta_seconds.restype = ctypes.c_double
-        def eta_seconds(o: Point, d: Point, speed_kmh: float) -> float:
-            return lib.eta_seconds(o.lat, o.lon, d.lat, d.lon, speed_kmh)
-    else:
-        def eta_seconds(o: Point, d: Point, speed_kmh: float) -> float:
-            return eta_seconds_py(o, d, speed_kmh)
-except Exception as e:
-    # Fallback if C++ load fails
-    def eta_seconds(o: Point, d: Point, speed_kmh: float) -> float:
-        return eta_seconds_py(o, d, speed_kmh)
 
 @app.get("/health")
-def health():
-    return {"ok": True}
+def health() -> dict:
+    observe_cache()
+    return {
+        "ok": True,
+        "cache": engine.cache_info(),
+        "cpp": USE_CPP,
+    }
+
 
 @app.get("/metrics")
-def metrics():
-    return PlainTextResponse(generate_latest())
+def metrics() -> PlainTextResponse:
+    observe_cache()
+    return PlainTextResponse(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
 
 @app.post("/eta")
-def eta(req: ETARequest):
-    req_counter.inc()
-    t0 = time.time()
+def eta(req: ETARequest) -> dict:
+    start = time.perf_counter()
+    profile = req.profile
+    REQUEST_COUNTER.labels(endpoint="single", profile=profile).inc()
     try:
-        seconds = eta_seconds(req.origin, req.destination, req.speed_kmh or 30.0)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        distance = haversine_km(
+            req.origin.lat,
+            req.origin.lon,
+            req.destination.lat,
+            req.destination.lon,
+        )
+        seconds = engine.eta_seconds(
+            (req.origin.lat, req.origin.lon),
+            (req.destination.lat, req.destination.lon),
+            req.speed_kmh,
+            profile,
+            req.departure,
+        )
+    except Exception as exc:  # pragma: no cover - guard rail
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     finally:
-        latency_hist.observe((time.time() - t0) * 1000.0)
-    return {"eta_seconds": seconds}
+        LATENCY_SECONDS.labels(endpoint="single", profile=profile).observe(time.perf_counter() - start)
+    DISTANCE_KM.observe(distance)
+    return {
+        "eta_seconds": seconds,
+        "distance_km": distance,
+        "profile": profile,
+    }
+
+
+@app.post("/eta/batch")
+def eta_batch(req: BatchETARequest) -> dict:
+    start = time.perf_counter()
+    profile_counts: dict[str, int] = {}
+    results: List[float] = []
+    for item in req.requests:
+        profile_counts[item.profile] = profile_counts.get(item.profile, 0) + 1
+        results.append(
+            engine.eta_seconds(
+                (item.origin.lat, item.origin.lon),
+                (item.destination.lat, item.destination.lon),
+                item.speed_kmh,
+                item.profile,
+                item.departure,
+            )
+        )
+    elapsed = time.perf_counter() - start
+    for profile, count in profile_counts.items():
+        REQUEST_COUNTER.labels(endpoint="batch", profile=profile).inc(count)
+        LATENCY_SECONDS.labels(endpoint="batch", profile=profile).observe(elapsed)
+    return {"eta_seconds": results, "count": len(results)}
+
+
+@app.post("/eta/route")
+def eta_route(req: RouteETARequest) -> dict:
+    REQUEST_COUNTER.labels(endpoint="route", profile=req.profile).inc()
+    total, legs = engine.route_eta(
+        [(point.lat, point.lon) for point in req.waypoints],
+        req.speed_kmh,
+        req.profile,
+        req.departure,
+    )
+    return {"total_seconds": total, "leg_seconds": legs}
+
+
+@app.post("/eta/matrix")
+def eta_matrix(req: MatrixETARequest) -> dict:
+    REQUEST_COUNTER.labels(endpoint="matrix", profile=req.profile).inc(len(req.origins))
+    matrix = engine.matrix_eta(
+        [(p.lat, p.lon) for p in req.origins],
+        [(p.lat, p.lon) for p in req.destinations],
+        req.speed_kmh,
+        req.profile,
+    )
+    return {"matrix": matrix}
+
+
+@app.post("/traffic")
+def update_traffic(update: TrafficUpdate) -> dict:
+    if update.hour is not None:
+        traffic_model.set_hourly_multiplier(update.hour, update.multiplier, update.profile)
+        return {"profile": update.profile, "hour": update.hour, "multiplier": update.multiplier}
+    assert update.lat is not None and update.lon is not None
+    zone = traffic_model.set_zone_multiplier(update.lat, update.lon, update.multiplier, update.profile)
+    return {"profile": update.profile, "zone": zone, "multiplier": update.multiplier}
+
+
+@app.get("/diagnostics")
+def diagnostics() -> Diagnostics:
+    observe_cache()
+    info = engine.cache_info()
+    return Diagnostics(cache_hits=info.get("hits", 0), cache_misses=info.get("misses", 0), traffic_profiles=traffic_model.snapshot())

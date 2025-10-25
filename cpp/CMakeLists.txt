@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.15)
+project(etacore)
+set(CMAKE_CXX_STANDARD 17)
+add_library(etacore SHARED eta_core.cpp)
+set_target_properties(etacore PROPERTIES OUTPUT_NAME "etacore")
